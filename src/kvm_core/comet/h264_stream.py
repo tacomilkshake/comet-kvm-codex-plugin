@@ -65,6 +65,12 @@ RECONNECT_BACKOFF_S = (0.2, 0.5, 1.0, 2.0)
 # The decoder cannot skip delta frames. If it falls this far behind, drop the
 # backlog and resynchronise on a requested key frame.
 MAX_DECODE_BACKLOG = 120
+# Same, measured in time: a frame that waited this long for the decoder means
+# the cached frame lags the screen, so the backlog is dropped.
+MAX_DECODE_LAG_S = 1.0
+# After the video source went offline or came back, frames received before that
+# moment show the old signal. Ask for a key frame first; reconnect if none came.
+SIGNAL_CHANGE_GRACE_S = 1.0
 FULL_FRAME_QUALITY = 90
 WS_MAX_SIZE = 32 * 1024 * 1024
 
@@ -101,6 +107,24 @@ def source_online(streamer_state: Any) -> Optional[bool]:
     return bool(source["online"])
 
 
+def sniff_codec(data: bytes) -> str:
+    """``h264`` or ``hevc`` from the first NAL unit of a key frame.
+
+    The Comet Q encoder has a ``video_format`` parameter (H.264 or H.265) that
+    the web UI forces to H.264 before it opens this socket. This client does not
+    change device settings, so it decodes whichever codec arrives. An H.265 key
+    frame starts with a VPS, SPS, PPS, AUD or prefix SEI NAL in layer 0; those
+    header bytes are not a legal start of an H.264 key frame.
+    """
+    start = data.find(b"\x00\x00\x01", 0, 64)
+    if start < 0 or start + 4 >= len(data):
+        return "h264"
+    first, second = data[start + 3], data[start + 4]
+    if first in (0x40, 0x42, 0x44, 0x46, 0x4E) and second == 0x01:
+        return "hevc"
+    return "h264"
+
+
 @dataclass(frozen=True)
 class CachedFrame:
     frame: Any  # av.VideoFrame
@@ -129,6 +153,7 @@ class H264Decoder:
     def __init__(self) -> None:
         self._ctx: Any = None
         self._need_key = True
+        self.codec: Optional[str] = None
 
     def reset(self) -> None:
         self._ctx = None
@@ -136,13 +161,15 @@ class H264Decoder:
 
     def decode(self, data: bytes, key: bool) -> Any:
         """Return the decoded ``av.VideoFrame`` or None. Raises on corrupt data."""
-        if self._need_key:
+        codec = sniff_codec(data) if key else self.codec
+        if self._need_key or codec != self.codec:
             if not key:
                 return None
-            ctx = av.CodecContext.create("h264", "r")
+            ctx = av.CodecContext.create(codec, "r")
             ctx.thread_type = "SLICE"
             ctx.flags |= av.codec.context.Flags.low_delay
             self._ctx = ctx
+            self.codec = codec
             self._need_key = False
         try:
             frames = self._ctx.decode(av.Packet(data))
@@ -203,6 +230,7 @@ class CometH264Stream:
         self.allow_offline = _env_flag("COMET_H264_ALLOW_OFFLINE")
         self.reconnect_backoff_s = RECONNECT_BACKOFF_S
         self.max_decode_backlog = MAX_DECODE_BACKLOG
+        self.max_decode_lag_s = MAX_DECODE_LAG_S
 
         self.generation = 0
         self.connected = False
@@ -231,6 +259,11 @@ class CometH264Stream:
         self._online: Optional[bool] = None
         self._online_at: Optional[float] = None
         self._online_pushed = False
+        # Frames received before this moment predate a video signal change.
+        self._fresh_after = 0.0
+        self.codec: Optional[str] = None
+        # One encode at a time: a frame's swscale context is not thread-safe.
+        self._encode_lock = asyncio.Lock()
 
         self._lock = threading.Lock()
         self._latest: Optional[CachedFrame] = None
@@ -288,6 +321,12 @@ class CometH264Stream:
 
     def note_online(self, online: Optional[bool], pushed: bool = False) -> None:
         """Record ``source.online``. ``pushed`` marks a control-websocket state event."""
+        if online != self._online and (online is False or self._online is False):
+            # Signal lost or restored (resolution change, sleep, replug): a frame
+            # cached before this moment must not be served as the live screen.
+            self._fresh_after = time.monotonic()
+            if online is not False:
+                self._want_key()
         self._online = online
         self._online_at = time.monotonic()
         if pushed:
@@ -307,6 +346,7 @@ class CometH264Stream:
             raise H264StreamError("H.264 capture stream is not running")
         deadline = time.monotonic() + (self.frame_timeout_s if timeout is None else timeout)
         forced = False
+        stale_since: Optional[float] = None
         failures_at_start = self.session_failures
         while True:
             online = await self._current_online()
@@ -316,9 +356,17 @@ class CometH264Stream:
             frame = self._latest
             if frame is not None and self.connected and frame.generation == self.generation:
                 age = now - frame.received_at
-                if age <= self.max_frame_age_s:
+                if frame.received_at < self._fresh_after:
+                    # Give the requested key frame a moment before reconnecting.
+                    if stale_since is None:
+                        stale_since = now
+                        self._want_key()
+                    if not forced and now - stale_since >= SIGNAL_CHANGE_GRACE_S:
+                        forced = True
+                        self._force_reconnect("no frame since the video signal changed")
+                elif age <= self.max_frame_age_s:
                     return frame
-                if not forced:
+                elif not forced:
                     forced = True
                     self._force_reconnect(f"cached frame is {age:.1f}s old")
             remaining = deadline - now
@@ -340,8 +388,12 @@ class CometH264Stream:
         cached = self._jpeg_cache
         if cached is not None and cached[0] == key:
             return cached[1]
-        data = await asyncio.to_thread(encode_jpeg, frame.frame, preview, max_width, quality)
-        self._jpeg_cache = (key, data)
+        async with self._encode_lock:
+            cached = self._jpeg_cache
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            data = await asyncio.to_thread(encode_jpeg, frame.frame, preview, max_width, quality)
+            self._jpeg_cache = (key, data)
         return data
 
     def status(self) -> dict[str, Any]:
@@ -351,6 +403,8 @@ class CometH264Stream:
             "connected": self.connected,
             "streaming": self.streaming,
             "source_online": self._online,
+            "codec": self.codec,
+            "decode_backlog": self._queue.qsize(),
             "width": frame.width if frame is not None else None,
             "height": frame.height if frame is not None else None,
             "frame_age_s": round(time.monotonic() - frame.received_at, 3) if frame is not None else None,
@@ -387,6 +441,8 @@ class CometH264Stream:
             state = "the Comet has not offered an H.264 stream"
         elif self._latest is None or self._latest.generation != self.generation:
             state = "no key frame has arrived on the current connection"
+        elif self._latest.received_at < self._fresh_after:
+            state = "no frame has arrived since the video signal changed"
         else:
             state = "the stream delivered no new frame"
         online = {True: "true", False: "false", None: "unknown"}[self._online]
@@ -466,8 +522,7 @@ class CometH264Stream:
         except Exception:
             # Unknown is not offline: the frame checks decide.
             if not self._online_pushed:
-                self._online = None
-                self._online_at = time.monotonic()
+                self.note_online(None)
             return
         self.note_online(online)
 
@@ -637,7 +692,21 @@ class CometH264Stream:
                 decoder.reset()
                 continue
             generation, key, data, received_at = item
-            if generation != self.generation:
+            # Skip (do not decode) what is left of the queue during shutdown.
+            if self._stopping or generation != self.generation:
+                continue
+            if time.monotonic() - received_at > self.max_decode_lag_s:
+                # Too far behind the screen: skip to the next key frame.
+                while True:
+                    try:
+                        skipped = work.get_nowait()
+                    except queue.Empty:
+                        break
+                    if skipped is _STOP:
+                        return
+                decoder.reset()
+                self.backlog_drops += 1
+                self._call_soon(self._want_key)
                 continue
             try:
                 frame = decoder.decode(data, key)
@@ -652,4 +721,5 @@ class CometH264Stream:
                 self._seq += 1
                 self._latest = CachedFrame(frame, self._seq, generation, received_at, key)
             self.frames_decoded += 1
+            self.codec = decoder.codec
             self._call_soon(self._notify)

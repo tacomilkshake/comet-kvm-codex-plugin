@@ -437,6 +437,9 @@ class CometClient:
         stream = self._h264_stream
         if stream is not None and stream.is_running():
             return stream
+        if stream is not None:
+            # A reader that ended by itself still owns a decode thread and a poll task.
+            asyncio.ensure_future(stream.stop())
         # Imported here so JPEG-only Comets never load the video decoder.
         from src.kvm_core.comet.h264_stream import MEDIA_WS_PATH, CometH264Stream
 
@@ -528,10 +531,7 @@ class CometClient:
         caller keeps the JPEG-path result. Once the stream is proven, the client
         stays on it.
         """
-        if self._capture_mode_setting() != "auto":
-            return None
-        failed_at = self._h264_fallback_failed_at
-        if failed_at is not None and time.monotonic() - failed_at < H264_FALLBACK_RETRY_S:
+        if not self._h264_fallback_allowed():
             return None
         try:
             data = await self._h264_screenshot(
@@ -550,6 +550,29 @@ class CometClient:
         if isinstance(self.capabilities, dict):
             self.capabilities["capture_mode"] = "h264"
         return data
+
+    def _h264_fallback_allowed(self) -> bool:
+        if self._capture_mode_setting() != "auto":
+            return False
+        failed_at = self._h264_fallback_failed_at
+        return failed_at is None or time.monotonic() - failed_at >= H264_FALLBACK_RETRY_S
+
+    async def _full_snapshot_is_not_jpeg(self, url: str) -> bool:
+        """Tell a Comet Q preview failure (HTTP 500) from a JPEG Comet's HTTP 500.
+
+        A Comet Pro or Comet X can also answer 500, and its media websocket
+        offers H.264 too, so the status alone must not move it to the stream.
+        The Comet Q answers a full snapshot with 200 and bytes that are not a
+        JPEG; anything else keeps the JPEG path and its original error.
+        """
+        try:
+            r = await self.http.get(url, params={"allow_offline": "true"}, timeout=5.0)
+        except httpx.HTTPError:
+            return False
+        if r.is_success and r.content and not r.content.startswith(JPEG_MAGIC):
+            return True
+        self._h264_fallback_failed_at = time.monotonic()
+        return False
 
     def capture_stream_status(self) -> Optional[dict]:
         """H.264 stream diagnostics for kvm_status (None on the JPEG path)."""
@@ -579,9 +602,9 @@ class CometClient:
             if r.status_code != 503:
                 # The Comet Q answers 500 for a preview and 200 with raw H.264
                 # bytes otherwise. Neither is a frame: use the video stream.
-                not_jpeg = r.status_code == 500 or (
-                    r.is_success and not r.content.startswith(JPEG_MAGIC)
-                )
+                not_jpeg = r.is_success and not r.content.startswith(JPEG_MAGIC)
+                if r.status_code == 500 and preview and self._h264_fallback_allowed():
+                    not_jpeg = await self._full_snapshot_is_not_jpeg(url)
                 if not_jpeg:
                     data = await self._h264_fallback(
                         f"HTTP {r.status_code}, {len(r.content)} bytes", preview, max_width, quality

@@ -123,8 +123,17 @@ read plus a local scale and JPEG encode (about 10 ms for a 1024-wide preview of
 a 4K frame on the development host, 60 ms for a full 4K frame).
 
 - **Routing:** the model is read at connect from `/api/upgrade/version` and
-  `/api/info` (`RMQ1`). Any other model that answers the snapshot with HTTP 500
-  or a body that is not a JPEG is moved to the stream on the first capture.
+  `/api/info` (`RMQ1`). Any other model whose full snapshot is HTTP 200 with a
+  body that is not a JPEG is moved to the stream on the first capture. A
+  preview that fails with HTTP 500 is classified with one full snapshot first:
+  a Comet Pro or Comet X can also answer 500, and it stays on the JPEG path.
+- **Codec:** the decoder follows the first NAL unit of each key frame (H.264 or
+  H.265), because the encoder's `video_format` parameter can be left on H.265
+  by a browser session. The client does not change that parameter.
+- **Signal changes and lag:** a frame received before `source.online` last
+  changed is not served; the client asks for a key frame and reconnects after 1
+  second without one. A frame that waited more than 1 second for the decoder
+  drops the backlog and resynchronises on a key frame.
   `COMET_CAPTURE_MODE=jpeg|h264` pins the path; the default is `auto`.
 - **Static screens:** an encoder can go silent when nothing changes. After 2
   seconds without video the client sends `0x01`, so the cached frame stays

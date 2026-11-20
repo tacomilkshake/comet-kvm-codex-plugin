@@ -33,6 +33,7 @@ from src.kvm_core.comet.h264_stream import (
     H264NoSignal,
     H264StreamError,
     encode_jpeg,
+    sniff_codec,
     source_online,
 )
 from src.kvm_core.tools_core import _capture_state
@@ -770,3 +771,172 @@ def test_capture_mode_can_be_pinned_by_environment(monkeypatch):
 
     assert run(scenario("jpeg", "RMQ1")) == "jpeg"
     assert run(scenario("h264", "RM10")) == "h264"
+
+
+# ── review follow-up ──────────────────────────────────────────────────
+
+
+def hevc_access_units(size: tuple[int, int], colors: list[tuple[int, int, int]]) -> list[tuple[bool, bytes]]:
+    ctx = av.CodecContext.create("libx265", "w")
+    ctx.width, ctx.height = size
+    ctx.pix_fmt = "yuv420p"
+    ctx.time_base = Fraction(1, 30)
+    ctx.options = {
+        "preset": "ultrafast",
+        "tune": "zerolatency",
+        "x265-params": "log-level=none:bframes=0:keyint=100000:repeat-headers=1",
+    }
+    units = []
+    for index, color in enumerate(colors):
+        frame = av.VideoFrame.from_image(PILImage.new("RGB", size, color)).reformat(format="yuv420p")
+        frame.pts = index
+        packets = ctx.encode(frame)
+        assert len(packets) == 1
+        units.append((bool(packets[0].is_keyframe), bytes(packets[0])))
+    return units
+
+
+def test_decoder_follows_the_codec_of_the_key_frame():
+    """The Comet Q encoder can be left on H.265 by a browser; decode what arrives."""
+    h264 = ScreenEncoder((320, 180))
+    key, data = h264.encode(RED)
+    assert sniff_codec(data) == "h264"
+    decoder = H264Decoder()
+    assert decoder.decode(data, key) is not None
+    assert decoder.codec == "h264"
+
+    units = hevc_access_units((320, 180), [GREEN, BLUE])
+    assert units[0][0] is True and sniff_codec(units[0][1]) == "hevc"
+    frame = decoder.decode(units[0][1], True)
+    assert decoder.codec == "hevc"
+    assert_color(encode_jpeg(frame, False, 0, 0), GREEN)
+    frame = decoder.decode(units[1][1], units[1][0])
+    assert_color(encode_jpeg(frame, False, 0, 0), BLUE)
+
+
+def test_frame_from_before_a_signal_change_is_not_served():
+    """A short signal loss (mode switch) must not leave the old screen as live."""
+    async def scenario():
+        async with CometQService() as service:
+            stream = make_stream(service, online_poll_s=30.0, idle_keyframe_s=60.0)
+            stream.start()
+            try:
+                assert_color(await stream.snapshot_jpeg(), RED)
+                before = stream.status()["frames_decoded"]
+
+                # Signal drops and returns well inside max_frame_age_s. The
+                # screen changed while it was away; no delta frame was sent.
+                stream.note_online(False, pushed=True)
+                service.screen_color = GREEN
+                stream.note_online(True, pushed=True)
+                assert_color(await stream.snapshot_jpeg(), GREEN)
+                assert stream.status()["frames_decoded"] > before
+                assert stream.forced_reconnects == 0, "a key frame request was enough"
+
+                # Same, on a Comet that ignores key frame requests: reconnect.
+                service.honor_key_requests = False
+                stream.note_online(False, pushed=True)
+                service.screen_color = BLUE
+                stream.note_online(True, pushed=True)
+                assert_color(await stream.snapshot_jpeg(), BLUE)
+                assert stream.forced_reconnects == 1
+            finally:
+                await stream.stop()
+
+    run(scenario())
+
+
+def test_decoder_that_lags_the_screen_skips_to_a_key_frame():
+    async def scenario():
+        async with CometQService() as service:
+            stream = make_stream(service, idle_keyframe_s=60.0, max_decode_lag_s=-1.0)
+            stream.start()
+            try:
+                await wait_until(lambda: stream.backlog_drops >= 1)
+                await wait_until(lambda: service.sessions[0].key_requests >= 1)
+                assert stream.status()["frames_decoded"] == 0
+                stream.max_decode_lag_s = 1.0
+                stream._want_key()
+                assert_color(await stream.snapshot_jpeg(), RED)
+                assert stream.status()["frames_decoded"] >= 1
+            finally:
+                await stream.stop()
+
+    run(scenario())
+
+
+def test_concurrent_captures_of_one_frame_encode_one_at_a_time(monkeypatch):
+    async def scenario():
+        import src.kvm_core.comet.h264_stream as module
+
+        active = 0
+        peak = 0
+        real = module.encode_jpeg
+
+        def tracked(*args):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            time.sleep(0.02)
+            try:
+                return real(*args)
+            finally:
+                active -= 1
+
+        monkeypatch.setattr(module, "encode_jpeg", tracked)
+        async with CometQService() as service:
+            stream = make_stream(service, idle_keyframe_s=60.0)
+            stream.start()
+            try:
+                await stream.get_frame()
+                results = await asyncio.gather(
+                    stream.snapshot_jpeg(True, 160, 50),
+                    stream.snapshot_jpeg(True, 200, 50),
+                    stream.snapshot_jpeg(False),
+                    stream.snapshot_jpeg(True, 160, 50),
+                )
+                assert peak == 1
+                assert [size_of(r) for r in results] == [(160, 90), (200, 112), (320, 180), (160, 90)]
+            finally:
+                await stream.stop()
+
+    run(scenario())
+
+
+class FlakyJpegCometService(JpegCometService):
+    """A Comet Pro/X whose preview snapshot fails with HTTP 500.
+
+    Its media websocket offers H.264, as the real kvmd media server does.
+    """
+
+    async def _handle(self, request: web.Request) -> web.StreamResponse:
+        if request.path == "/api/streamer/snapshot" and request.query.get("preview") == "true":
+            self.requests.append({"path": request.path, "query": dict(request.query)})
+            return web.json_response({"ok": False, "result": {}}, status=500)
+        return await super()._handle(request)
+
+
+def test_http_500_on_a_jpeg_comet_does_not_move_it_to_the_stream():
+    async def scenario():
+        async with FlakyJpegCometService(model="RM10") as service:
+            client = await connect_q(service)
+            try:
+                with pytest.raises(httpx.HTTPStatusError):
+                    await client.get_screenshot(preview=True)
+                assert client.capture_mode == "jpeg"
+                assert client._h264_stream is None
+                assert service.sessions == [], "no media socket was opened"
+                assert client.last_capture_ok is False
+
+                # The classifying full snapshot is not repeated on the next failure.
+                calls = len([r for r in service.requests if r["path"] == "/api/streamer/snapshot"])
+                with pytest.raises(httpx.HTTPStatusError):
+                    await client.get_screenshot(preview=True)
+                assert len(
+                    [r for r in service.requests if r["path"] == "/api/streamer/snapshot"]
+                ) == calls + 1
+                assert await client.get_screenshot(preview=False) == service.image
+            finally:
+                await client.disconnect()
+
+    run(scenario())

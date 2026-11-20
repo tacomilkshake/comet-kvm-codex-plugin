@@ -142,5 +142,5 @@ screen, and the D7 rule against an always-on OCR or state loop is unchanged.
 
 A cached frame is never returned as current without evidence: `source.online`
 false raises a no-signal error, a frame from an earlier connection is never
-served, and a frame older than 5 seconds forces a reconnect for a new key
-frame. Detail: [`docs/reference/comet-api.md`](reference/comet-api.md)#screenshot--ocr.
+served, a frame from before the last signal loss or return is never served,
+and a frame older than 5 seconds forces a reconnect for a new key frame. Detail: [`docs/reference/comet-api.md`](reference/comet-api.md)#screenshot--ocr.
