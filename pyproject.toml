@@ -24,6 +24,8 @@ dependencies = [
     "httpx>=0.28.1",
     "Pillow>=12.3.0",
     "pytesseract>=0.3.13",
+    # H.264 decode for Comets whose snapshot endpoint is not JPEG (Comet Q / GL-RMQ1).
+    "av>=16.0.0",
 ]
 
 [project.urls]

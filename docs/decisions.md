@@ -123,3 +123,24 @@ dependency, not an open device-OCR project.
 
 Evidence and the correction history are retained as a dated, non-authoritative
 record in [`docs/research/glkvm-client-audit-2026-07-15.md`](research/glkvm-client-audit-2026-07-15.md).
+
+## D-K10 — Comet Q frames come from the H.264 stream, decoded with PyAV
+
+The Comet Q (GL-RMQ1, encoder `RV1126-H264`) has no JPEG snapshot:
+`GET /api/streamer/snapshot` returns raw H.264 slice bytes labelled `image/jpeg`
+and HTTP 500 with `preview=true` (observed on firmware V1.8.4, kvmd 4.82,
+2026-11-20). For that model the client holds `WSS /api/media/ws` open for the
+life of the session and decodes every frame on a worker thread, so a screenshot
+is a cache read plus a local scale and JPEG encode. Comet Pro and Comet X keep
+the JPEG snapshot path and never load the decoder.
+
+PyAV (`av`) is the one added runtime dependency. It is the fixture-backed need
+D-K8 asks for: the appliance offers no other frame source, and PyAV ships
+FFmpeg in its wheels, so the MCP host needs no system codec. This reader is a
+transport loop like the watchdog and pinger (D-K4). It does not interpret the
+screen, and the D7 rule against an always-on OCR or state loop is unchanged.
+
+A cached frame is never returned as current without evidence: `source.online`
+false raises a no-signal error, a frame from an earlier connection is never
+served, and a frame older than 5 seconds forces a reconnect for a new key
+frame. Detail: [`docs/reference/comet-api.md`](reference/comet-api.md)#screenshot--ocr.

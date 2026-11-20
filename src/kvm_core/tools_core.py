@@ -101,12 +101,18 @@ def _capture_state(client) -> dict:
     """Capture-path diagnostics (503 retry health) for kvm_status."""
     if client is None:
         return {"ok": None, "error": None, "at": None, "retries": 0}
-    return {
+    state = {
         "ok": getattr(client, "last_capture_ok", None),
         "error": getattr(client, "last_capture_error", None),
         "at": getattr(client, "last_capture_at", None),
         "retries": getattr(client, "capture_retry_count", 0),
     }
+    # Comet Q: frames come from the decoded H.264 stream, not the JPEG snapshot.
+    if getattr(client, "capture_mode", "jpeg") == "h264":
+        state["mode"] = "h264"
+        stream_status = getattr(client, "capture_stream_status", None)
+        state["stream"] = stream_status() if callable(stream_status) else None
+    return state
 
 
 def _safe_screenshot_path(requested_path: str) -> Path:

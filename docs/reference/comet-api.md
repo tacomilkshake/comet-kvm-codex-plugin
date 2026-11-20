@@ -102,6 +102,51 @@ not an auth failure. Any other HTTP status is raised immediately without
 retry. If the session dies mid-retry, capture aborts rather than polling a
 dead session. `kvm_status` reports the last capture outcome and retry count.
 
+**Comet Q (GL-RMQ1) has no JPEG snapshot.** On firmware V1.8.4 (kvmd 4.82,
+encoder `RV1126-H264`) the snapshot route returns about 80 bytes of raw H.264
+slice data labelled `image/jpeg`, and HTTP 500 with `preview=true`. The client
+therefore reads frames from kvmd's media server:
+
+```
+WSS /api/media/ws            (auth: Token header / auth_token cookie)
+server → {"event_type": "media", "event": {"video": {"h264": {"profile_level_id": "..."}}}}
+client → {"event_type": "start", "event": {"type": "video", "format": "h264"}}
+client → 0x00                 heartbeat, every second; server answers 0xFF
+client → 0x01                 ask the encoder for a key frame
+server → 0x01 <key flag> <Annex-B access unit>    one frame per message
+```
+
+The first frame for a new client is a key frame. `src/kvm_core/comet/h264_stream.py`
+keeps this socket open while the session is connected, decodes each message on a
+worker thread with PyAV, and holds the latest frame. A screenshot is a cache
+read plus a local scale and JPEG encode (about 10 ms for a 1024-wide preview of
+a 4K frame on the development host, 60 ms for a full 4K frame).
+
+- **Routing:** the model is read at connect from `/api/upgrade/version` and
+  `/api/info` (`RMQ1`). Any other model that answers the snapshot with HTTP 500
+  or a body that is not a JPEG is moved to the stream on the first capture.
+  `COMET_CAPTURE_MODE=jpeg|h264` pins the path; the default is `auto`.
+- **Static screens:** an encoder can go silent when nothing changes. After 2
+  seconds without video the client sends `0x01`, so the cached frame stays
+  current. A frame older than `COMET_H264_MAX_FRAME_AGE_S` (default 5) is not
+  served: the socket is reconnected and the capture waits up to
+  `COMET_H264_FRAME_TIMEOUT_S` (default 5) for the new key frame.
+- **No signal:** `source.online` comes from the `streamer` state events on
+  `/api/ws` and from `GET /api/streamer` (every 2 s until an event has been
+  seen, then every 30 s). When it is false the capture raises
+  `CometNoSignalError` and returns no frame. `COMET_H264_ALLOW_OFFLINE=1`
+  returns frames anyway.
+- **Reconnects:** a closed socket or five missed heartbeats reconnects with
+  backoff 0.2/0.5/1/2 s. A frame from an earlier connection is never served.
+
+> **Source:** Comet Q web UI JavaScript and a live decode on 2026-11-20
+> (media event, start, heartbeat, video messages); `0x01` key request and the
+> message layout from `kvmd/apps/media/server.py` at the pinned
+> [`gl-inet/glkvm@9bd8ad11`](https://github.com/gl-inet/glkvm/blob/9bd8ad11ba03d220401b0b6a4208bbfd84ed6107/kvmd/apps/media/server.py).
+> The media server is a separate kvmd app and is not in the generated endpoint
+> corpus. Confidence: **Medium** — the plugin path is contract-tested against a
+> loopback fake and is not yet qualified on a Comet Q.
+
 The PiKVM fork still contains server-side OCR parameters, but GL.iNet firmware
 1.9's product UI Text Recognition code crops its canvas and runs bundled
 Tesseract.js/WASM in the controlling browser. A live browser recognition
@@ -210,6 +255,7 @@ those fields should be inferred from another.
 | `GET /api/info`, `/api/upgrade/version`, `/api/system/capability` | Yes, read-only | Successful capability discovery and metadata reads 2026-07-27 |
 | `GET /api/hid`, `/api/atx`, `/api/msd`, `/api/streamer` | Yes, read-only | Successful subsystem reads 2026-07-27; HID was not sent and ATX/media were not changed |
 | `GET /api/streamer/snapshot` | Mixed | Successful JPEGs in the live smoke; a later read returned HTTP 503 on 2026-07-27 |
+| `WSS /api/media/ws` (Comet Q H.264 capture) | Protocol only | Frames decoded from a Comet Q (V1.8.4) with a standalone script on 2026-11-20; the MCP capture path is contract-tested only |
 | `GET /api/streamer/ocr` | Yes | HTTP 200; `enabled: false` on unit (legacy server OCR; MCP uses host Tesseract) |
 | Snapshot OCR (`ocr=true`) | N/A for MCP | Product Text Recognition is browser Tesseract.js; MCP does not use legacy OCR snapshot |
 | WebSocket HID + stream | Yes, read-only | MCP uses `?stream=true`; pong/receiver healthy on 2026-07-27; no physical HID effect was tested |
@@ -335,7 +381,9 @@ See [`docs/kvm-core.md`](../kvm-core.md) for the BIOS interaction lifecycle.
 
 ## Internal Background Tasks (Asyncio)
 
-The MCP process runs **two background asyncio loops** for transport reliability:
+The MCP process runs **two background asyncio loops** for transport reliability.
+A Comet Q session adds the H.264 capture reader (media websocket, 1 s heartbeat,
+decode thread) described under [Screenshot / OCR](#screenshot--ocr):
 
 ### `_watchdog_loop` (40ms period)
 - Monitors held keys
@@ -410,6 +458,10 @@ Device tools auto-connect the default target on demand, so most sessions never c
 | `COMET_HOST` | no | no | `192.168.0.126` | LAN IP of the Comet (live tests / scripts) |
 | `COMET_USERNAME` | no | no | `admin` | Comet login username |
 | `COMET_DISABLE_BIOS_SIDECAR` | no | no | unset | Set to `1` to skip loading `bios_sidecar` |
+| `COMET_CAPTURE_MODE` | no | no | `auto` | `auto` \| `jpeg` \| `h264`; `auto` uses the H.264 stream for a Comet Q and the JPEG snapshot otherwise |
+| `COMET_H264_MAX_FRAME_AGE_S` | no | no | `5` | Oldest cached H.264 frame that a capture may return |
+| `COMET_H264_FRAME_TIMEOUT_S` | no | no | `5` | Longest wait for a current H.264 frame (cold start, reconnect) |
+| `COMET_H264_ALLOW_OFFLINE` | no | no | unset | Set to `1` to return H.264 frames while the Comet reports no signal |
 | `VLM_API_KEY` | **yes** | for `openrouter`/`openai` only | — | OpenAI-compatible API key; falls back to Doppler secret `OPENROUTER_API_KEY` when unset. `codex` and `aperture` need no key |
 | `VLM_PROVIDER` | no | **yes for BIOS perception** | — | `codex` \| `aperture` \| `openrouter` \| `ollama` \| `vllm` \| `openai`; missing/unsupported values fail closed. `codex` shells out to the local Codex CLI (`codex exec`, ChatGPT-subscription auth); `aperture` targets the tailnet Aperture gateway (tailnet-identity auth) |
 | `VLM_MODEL` | no | no | provider default; codex → `gpt-5.6-sol`; aperture → `gemini-oai/gemini-3.5-flash`; openrouter → `openrouter/free` (Free Models Router) | Model string for the OpenAI-compatible endpoint (or `codex exec -m`) |

@@ -87,6 +87,14 @@ Any other HTTP status is raised immediately without retry. If the session dies
 mid-retry, capture aborts rather than continuing to poll a dead session.
 `kvm_status` surfaces the last capture outcome and retry count.
 
+**Comet Q (GL-RMQ1):** this model has no JPEG snapshot, so the same tools read
+the latest frame from a persistent H.264 decoder on `/api/media/ws` and scale
+and JPEG-encode it in the MCP process. `preview`, `max_width`, and `quality`
+keep their meaning; `preview=false` returns the full frame. A target that sends
+no video raises a no-signal capture error instead of an old frame. `kvm_status`
+adds `capture.mode: "h264"` and the stream's state. See
+[`docs/decisions.md`](decisions.md) D-K10.
+
 The KVM core has no screen semantics. It sends input, captures frames, runs OCR, and exposes Comet hardware APIs. It does not know whether the screen is BIOS, Windows, an installer, a shell, a crash screen, POST, recovery UI, or anything else.
 
 Both text and coordinate OCR capture a frame and run in the MCP host process. Pillow decodes the frame; pytesseract's spacing-preserving text output backs `kvm_ocr_text`, while its TSV/dictionary output supplies boxes and confidence for structured/click OCR. Calls have a 15-second timeout and run in a worker thread so OCR cannot block the asyncio watchdog and pinger.

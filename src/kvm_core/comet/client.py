@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import json
 from dataclasses import dataclass
@@ -120,8 +121,31 @@ MSD_UPLOAD_TIMEOUT = httpx.Timeout(600.0, connect=30.0)
 CAPTURE_BACKOFF_SCHEDULE = (0.1, 0.2, 0.4, 0.8)
 
 
+# Comets whose snapshot endpoint does not return a JPEG: the Comet Q (GL-RMQ1,
+# RV1126 encoder) returns raw H.264 slice bytes there, and HTTP 500 for a
+# preview. Their frames are decoded from the media websocket's H.264 stream
+# instead (see h264_stream.py).
+H264_CAPTURE_MODELS = ("rmq1",)
+CAPTURE_MODE_ENV = "COMET_CAPTURE_MODE"  # auto (default) | jpeg | h264
+CAPTURE_MODES = {"auto", "jpeg", "h264"}
+JPEG_MAGIC = b"\xff\xd8"
+# First-frame budget when an unlisted model's snapshot turns out not to be JPEG.
+H264_FALLBACK_TIMEOUT = 4.0
+H264_FALLBACK_RETRY_S = 60.0
+
+
 class CometCaptureError(RuntimeError):
     """Screen capture failed. Session and auth state are left intact."""
+
+
+class CometNoSignalError(CometCaptureError):
+    """The Comet reports no video signal from the target; no frame was returned."""
+
+
+def needs_h264_capture(*sources: Any) -> bool:
+    """Whether connect-time identity (model, version and info results) names an H.264-only Comet."""
+    text = json.dumps(sources, default=str).lower()
+    return any(model in text for model in H264_CAPTURE_MODELS)
 
 
 @dataclass
@@ -184,6 +208,12 @@ class CometClient:
         self.last_capture_error: Optional[str] = None
         self.last_capture_at: Optional[float] = None
         self.capture_retry_count = 0
+        # "jpeg" reads the snapshot endpoint, "h264" the decoded media stream.
+        self.capture_mode = "jpeg"
+        self._h264_stream: Any = None
+        self._h264_fallback_failed_at: float | None = None
+        # Last streamer source.online pushed on the control websocket: (seen, value).
+        self._pushed_source_online: tuple[bool, Optional[bool]] = (False, None)
 
         self.min_down_up_gap = 0.025
         self.inter_char_gap = 0.010
@@ -293,10 +323,12 @@ class CometClient:
         except Exception as exc:
             LOG.warning("Capability discovery failed: %s", type(exc).__name__)
             self.capabilities = {"error": type(exc).__name__}
+        self._select_capture_mode()
         LOG.info("Connected to Comet KVM at %s (target=%s)", self.base_url, self.target_id)
         return True
 
     async def _cleanup_failed_connect(self) -> None:
+        await self._stop_h264_stream()
         for t in (self.watchdog_task, self.pinger_task, self.receiver_task):
             if t:
                 t.cancel()
@@ -334,6 +366,8 @@ class CometClient:
             pass
 
         self.held.clear()
+        await self._stop_h264_stream()
+        self._pushed_source_online = (False, None)
 
         for t in (self.watchdog_task, self.pinger_task, self.receiver_task):
             if t:
@@ -375,9 +409,159 @@ class CometClient:
         self.last_capture_error = error
         self.last_capture_at = time.time()
 
+    # ── H.264 capture (Comet Q) ────────────────────────────────────
+
+    def _capture_mode_setting(self) -> str:
+        setting = os.environ.get(CAPTURE_MODE_ENV, "auto").strip().lower()
+        return setting if setting in CAPTURE_MODES else "auto"
+
+    def _select_capture_mode(self) -> None:
+        """Pick the capture path from connect-time identity and start the stream."""
+        setting = self._capture_mode_setting()
+        profile = self.capabilities if isinstance(self.capabilities, dict) else {}
+        if setting == "auto":
+            identity = (
+                profile.get("model"),
+                (profile.get("version") or {}).get("result"),
+                (profile.get("info") or {}).get("result"),
+            )
+            setting = "h264" if needs_h264_capture(*identity) else "jpeg"
+        self.capture_mode = setting
+        if isinstance(self.capabilities, dict):
+            self.capabilities["capture_mode"] = setting
+        if setting == "h264":
+            # Warm the decoder now so the first screenshot is already a cache read.
+            self._ensure_h264_stream()
+
+    def _ensure_h264_stream(self):
+        stream = self._h264_stream
+        if stream is not None and stream.is_running():
+            return stream
+        # Imported here so JPEG-only Comets never load the video decoder.
+        from src.kvm_core.comet.h264_stream import MEDIA_WS_PATH, CometH264Stream
+
+        parsed = urlparse(self.base_url)
+        ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+        sslctx = None
+        if ws_scheme == "wss" and not self.verify_ssl:
+            sslctx = _ssl.create_default_context()
+            sslctx.check_hostname = False
+            sslctx.verify_mode = _ssl.CERT_NONE
+        token = self.auth_token or ""
+        stream = CometH264Stream(
+            f"{ws_scheme}://{parsed.netloc}{MEDIA_WS_PATH}",
+            {"Cookie": f"auth_token={token}", "Token": token},
+            ssl=sslctx,
+            online_probe=self._streamer_source_online,
+            name=self.target_id,
+        )
+        seen, online = self._pushed_source_online
+        if seen:
+            stream.note_online(online, pushed=True)
+        stream.start()
+        self._h264_stream = stream
+        return stream
+
+    async def _stop_h264_stream(self) -> None:
+        stream, self._h264_stream = self._h264_stream, None
+        if stream is not None:
+            try:
+                await stream.stop()
+            except Exception:
+                pass
+
+    async def _streamer_source_online(self) -> Optional[bool]:
+        """GET /api/streamer -> streamer.source.online (None when not reported)."""
+        from src.kvm_core.comet.h264_stream import source_online
+
+        if not self.http:
+            return None
+        r = await self.http.get(f"{self.base_url}/api/streamer", timeout=2.0)
+        if not r.is_success:
+            return None
+        return source_online(_unwrap_ok_json(r).get("streamer"))
+
+    def _note_streamer_event(self, event: Any) -> None:
+        """Track source.online from a pushed streamer state (full or partial).
+
+        kvmd sends the ``streamer`` key only when that part changed, so an event
+        without it leaves the last value standing.
+        """
+        if not isinstance(event, dict) or "streamer" not in event:
+            return
+        streamer = event["streamer"]
+        source = streamer.get("source") if isinstance(streamer, dict) else None
+        online = bool(source["online"]) if isinstance(source, dict) and "online" in source else None
+        self._pushed_source_online = (True, online)
+        stream = self._h264_stream
+        if stream is not None:
+            stream.note_online(online, pushed=True)
+
+    async def _h264_screenshot(
+        self,
+        preview: bool,
+        max_width: int,
+        quality: int,
+        timeout: float | None = None,
+        fail_fast: bool = False,
+    ) -> bytes:
+        from src.kvm_core.comet.h264_stream import H264NoSignal, H264StreamError
+
+        stream = self._ensure_h264_stream()
+        try:
+            data = await stream.snapshot_jpeg(preview, max_width, quality, timeout, fail_fast)
+        except H264NoSignal as exc:
+            self._record_capture(False, str(exc))
+            raise CometNoSignalError(str(exc)) from exc
+        except H264StreamError as exc:
+            self._record_capture(False, str(exc))
+            raise CometCaptureError(str(exc)) from exc
+        self._record_capture(True)
+        return data
+
+    async def _h264_fallback(
+        self, reason: str, preview: bool, max_width: int, quality: int
+    ) -> Optional[bytes]:
+        """Try the H.264 stream after a snapshot that is not a JPEG.
+
+        Returns None when this Comet has no usable H.264 media stream, so the
+        caller keeps the JPEG-path result. Once the stream is proven, the client
+        stays on it.
+        """
+        if self._capture_mode_setting() != "auto":
+            return None
+        failed_at = self._h264_fallback_failed_at
+        if failed_at is not None and time.monotonic() - failed_at < H264_FALLBACK_RETRY_S:
+            return None
+        try:
+            data = await self._h264_screenshot(
+                preview, max_width, quality, H264_FALLBACK_TIMEOUT, fail_fast=True
+            )
+        except CometCaptureError:
+            stream = self._h264_stream
+            if stream is None or not stream.h264_offered:
+                self._h264_fallback_failed_at = time.monotonic()
+                await self._stop_h264_stream()
+                return None
+            self.capture_mode = "h264"
+            raise
+        LOG.info("Snapshot is not a JPEG (%s); capturing from the H.264 stream", reason)
+        self.capture_mode = "h264"
+        if isinstance(self.capabilities, dict):
+            self.capabilities["capture_mode"] = "h264"
+        return data
+
+    def capture_stream_status(self) -> Optional[dict]:
+        """H.264 stream diagnostics for kvm_status (None on the JPEG path)."""
+        stream = self._h264_stream
+        return stream.status() if stream is not None else None
+
     async def get_screenshot(self, preview: bool = True, max_width: int = 1024, quality: int = 60) -> bytes:
         if not self.http:
             raise RuntimeError("Not connected")
+        if self.capture_mode == "h264":
+            self.capture_retry_count = 0
+            return await self._h264_screenshot(preview, max_width, quality)
         params = {"allow_offline": "true"}
         if preview:
             params["preview"] = "true"
@@ -393,6 +577,17 @@ class CometClient:
                 self._record_capture(False, f"{type(exc).__name__}: {exc}")
                 raise
             if r.status_code != 503:
+                # The Comet Q answers 500 for a preview and 200 with raw H.264
+                # bytes otherwise. Neither is a frame: use the video stream.
+                not_jpeg = r.status_code == 500 or (
+                    r.is_success and not r.content.startswith(JPEG_MAGIC)
+                )
+                if not_jpeg:
+                    data = await self._h264_fallback(
+                        f"HTTP {r.status_code}, {len(r.content)} bytes", preview, max_width, quality
+                    )
+                    if data is not None:
+                        return data
                 if r.is_error:
                     self._record_capture(False, f"HTTP {r.status_code} from {url}")
                 r.raise_for_status()
@@ -652,6 +847,8 @@ class CometClient:
                     LOG.warning("Comet WebSocket kickout received")
                     self._ws_healthy = False
                     return
+                if event_type in ("streamer", "streamer_state"):
+                    self._note_streamer_event(event)
                 if isinstance(event_type, str) and event_type.endswith("_state"):
                     self.server_state[event_type] = event
                 elif isinstance(event_type, str):
